@@ -13,13 +13,13 @@ const PID = {
     Kp: 1.7,
     Ki: 0.03,
     Kd: 0.17,
-    min_pwm: 10,
-    max_pwm: 100,
+    min_pwm: 5,
+    max_pwm: 50,
     stop_margin: 0.017,
     integral: 0,
     prev_error: 0,
     prev_time: Date.now(),
-    target_angle: null,  // Changed to null to indicate no setpoint
+    target_angle: null,
     current_angle: 0
 };
 
@@ -28,7 +28,7 @@ const deviceState = {
     port: 8766,
     address: null,
     authenticated: false,
-    hasSetpoint: false  // New flag to track setpoint status
+    hasSetpoint: false
 };
 
 // Create HTTP server for web interface
@@ -56,24 +56,30 @@ function calculatePID(targetAngle, currentAngle) {
 
     const current_time = Date.now();
     const dt = (current_time - PID.prev_time) / 1000;
-
     const error = targetAngle - currentAngle;
-    PID.integral += error * dt;
     
-    const maxIntegral = 50;
-    PID.integral = Math.max(Math.min(PID.integral, maxIntegral), -maxIntegral);
+    // Dynamic integral clamping
+    const maxIntegral = 10;
+    if (Math.abs(error) > PID.stop_margin * 2) {
+        PID.integral += error * dt;
+        PID.integral = Math.max(Math.min(PID.integral, maxIntegral), -maxIntegral);
+    } else {
+        PID.integral = 0;
+    }
 
     const derivative = dt > 0 ? (error - PID.prev_error) / dt : 0;
-    const output = (PID.Kp * error) + (PID.Ki * PID.integral) + (PID.Kd * derivative);
+    let output = (PID.Kp * error) + (PID.Ki * PID.integral) + (PID.Kd * derivative);
     
-    let pwm = Math.min(Math.max(Math.abs(output), PID.min_pwm), PID.max_pwm);
-    pwm *= Math.sign(output);
-
+    // Dynamic PWM scaling
+    const errorMagnitude = Math.abs(error);
+    const dynamicMaxPwm = errorMagnitude > 0.5 ? PID.max_pwm : PID.max_pwm * 0.6;
+    output = Math.min(Math.max(output, -dynamicMaxPwm), dynamicMaxPwm);
+    
     PID.prev_error = error;
     PID.prev_time = current_time;
 
     return {
-        pwm: Math.round(pwm),
+        pwm: Math.round(output),
         error: error
     };
 }
@@ -84,7 +90,6 @@ function sendUDPCommand(command) {
         return;
     }
 
-    // Convert IPv6 format to IPv4 if needed
     let ipAddress = deviceState.address;
     if (ipAddress.startsWith('::ffff:')) {
         ipAddress = ipAddress.substr(7);
@@ -114,7 +119,6 @@ wss.on('connection', (ws, req) => {
     const clientType = req.headers.origin ? 'web' : 'device';
     let clientAddress = req.socket.remoteAddress;
     
-    // Convert IPv6 to IPv4 if needed
     if (clientAddress.startsWith('::ffff:')) {
         clientAddress = clientAddress.substr(7);
     }
@@ -123,7 +127,6 @@ wss.on('connection', (ws, req) => {
 
     ws.on('message', (message) => {
         if (clientType === 'web') {
-            // Handle web client setpoint commands
             try {
                 const setpoint = parseFloat(message.toString());
                 if (!isNaN(setpoint)) {
@@ -131,12 +134,10 @@ wss.on('connection', (ws, req) => {
                     PID.target_angle = setpoint * Math.PI / 180;
                     deviceState.hasSetpoint = true;
                     
-                    // Reset PID parameters for new setpoint
                     PID.integral = 0;
                     PID.prev_error = 0;
                     PID.prev_time = Date.now();
 
-                    // Send command only if device is ready
                     if (deviceState.authenticated) {
                         const pidOutput = calculatePID(PID.target_angle, PID.current_angle);
                         sendUDPCommand(pidOutput.pwm);
@@ -146,7 +147,6 @@ wss.on('connection', (ws, req) => {
                 console.error('Error processing setpoint:', error);
             }
         } else {
-            // Handle controller authentication and feedback
             if (!deviceState.authenticated) {
                 try {
                     const authData = JSON.parse(message);
@@ -163,7 +163,6 @@ wss.on('connection', (ws, req) => {
                     ws.close();
                 }
             } else {
-                // Process position feedback only if we have a setpoint
                 try {
                     const currentAngle = parseFloat(message);
                     if (!isNaN(currentAngle)) {
@@ -176,6 +175,7 @@ wss.on('connection', (ws, req) => {
                                 sendUDPCommand(pidOutput.pwm);
                             } else {
                                 console.log('Target position reached');
+                                sendUDPCommand(0); // Send stop command
                             }
                         }
                     }
@@ -189,8 +189,8 @@ wss.on('connection', (ws, req) => {
     ws.on('close', () => {
         if (clientType === 'device') {
             deviceState.authenticated = false;
-            deviceState.hasSetpoint = false;  // Reset setpoint flag when device disconnects
-            PID.target_angle = null;  // Reset target angle
+            deviceState.hasSetpoint = false;
+            PID.target_angle = null;
             console.log(`Controller disconnected: ${clientAddress}`);
         } else {
             console.log(`Web client disconnected: ${clientAddress}`);
