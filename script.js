@@ -19,16 +19,16 @@ const PID = {
     integral: 0,
     prev_error: 0,
     prev_time: Date.now(),
-    target_angle: 0,
-    current_angle: 0,
-    initialized: false  // Flag to track if setpoint has been received
+    target_angle: null,  // Changed to null to indicate no setpoint
+    current_angle: 0
 };
 
 // Store device information
 const deviceState = {
     port: 8766,
     address: null,
-    authenticated: false
+    authenticated: false,
+    hasSetpoint: false  // New flag to track setpoint status
 };
 
 // Create HTTP server for web interface
@@ -50,8 +50,7 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server });
 
 function calculatePID(targetAngle, currentAngle) {
-    // Only calculate PID if we've received an initial setpoint
-    if (!PID.initialized) {
+    if (targetAngle === null) {
         return { pwm: 0, error: 0 };
     }
 
@@ -80,30 +79,46 @@ function calculatePID(targetAngle, currentAngle) {
 }
 
 function sendUDPCommand(command) {
-    if (!deviceState.address || !PID.initialized) {
-        console.log('Cannot send command: No controller connected or no setpoint received');
+    if (!deviceState.address || !deviceState.hasSetpoint) {
+        console.log('Cannot send command: Device not ready or no setpoint received');
         return;
     }
 
-    const encryptedMessage = JSON.stringify(enkripsi(JSON.stringify(command)));
-    udpSocket.send(
-        encryptedMessage,
-        deviceState.port,
-        deviceState.address,
-        (err) => {
-            if (err) {
-                console.error('UDP send error:', err);
-            } else {
-                console.log(`UDP command sent to ${deviceState.address}:${deviceState.port}: ${command}`);
+    // Convert IPv6 format to IPv4 if needed
+    let ipAddress = deviceState.address;
+    if (ipAddress.startsWith('::ffff:')) {
+        ipAddress = ipAddress.substr(7);
+    }
+
+    try {
+        const encryptedMessage = JSON.stringify(enkripsi(JSON.stringify(command)));
+        udpSocket.send(
+            encryptedMessage,
+            deviceState.port,
+            ipAddress,
+            (err) => {
+                if (err) {
+                    console.error('UDP send error:', err);
+                } else {
+                    console.log(`UDP command sent to ${ipAddress}:${deviceState.port}: ${command}`);
+                }
             }
-        }
-    );
+        );
+    } catch (error) {
+        console.error('Error sending UDP command:', error);
+    }
 }
 
 // WebSocket connection handler
 wss.on('connection', (ws, req) => {
     const clientType = req.headers.origin ? 'web' : 'device';
-    const clientAddress = req.socket.remoteAddress;
+    let clientAddress = req.socket.remoteAddress;
+    
+    // Convert IPv6 to IPv4 if needed
+    if (clientAddress.startsWith('::ffff:')) {
+        clientAddress = clientAddress.substr(7);
+    }
+    
     console.log(`New ${clientType} client connected from ${clientAddress}`);
 
     ws.on('message', (message) => {
@@ -114,21 +129,16 @@ wss.on('connection', (ws, req) => {
                 if (!isNaN(setpoint)) {
                     console.log(`Received setpoint: ${setpoint}°`);
                     PID.target_angle = setpoint * Math.PI / 180;
-                    
-                    // Initialize PID controller with first setpoint
-                    if (!PID.initialized) {
-                        PID.initialized = true;
-                        console.log('PID controller initialized with first setpoint');
-                    }
+                    deviceState.hasSetpoint = true;
                     
                     // Reset PID parameters for new setpoint
                     PID.integral = 0;
                     PID.prev_error = 0;
                     PID.prev_time = Date.now();
 
-                    // Calculate and send initial PWM command
-                    const pidOutput = calculatePID(PID.target_angle, PID.current_angle);
+                    // Send command only if device is ready
                     if (deviceState.authenticated) {
+                        const pidOutput = calculatePID(PID.target_angle, PID.current_angle);
                         sendUDPCommand(pidOutput.pwm);
                     }
                 }
@@ -153,15 +163,14 @@ wss.on('connection', (ws, req) => {
                     ws.close();
                 }
             } else {
-                // Process position feedback
+                // Process position feedback only if we have a setpoint
                 try {
                     const currentAngle = parseFloat(message);
                     if (!isNaN(currentAngle)) {
                         PID.current_angle = currentAngle;
                         console.log(`Position feedback: ${currentAngle * 180 / Math.PI}°`);
                         
-                        // Only send new commands if we've received a setpoint
-                        if (PID.initialized) {
+                        if (deviceState.hasSetpoint) {
                             const pidOutput = calculatePID(PID.target_angle, PID.current_angle);
                             if (Math.abs(pidOutput.error) > PID.stop_margin) {
                                 sendUDPCommand(pidOutput.pwm);
@@ -180,6 +189,8 @@ wss.on('connection', (ws, req) => {
     ws.on('close', () => {
         if (clientType === 'device') {
             deviceState.authenticated = false;
+            deviceState.hasSetpoint = false;  // Reset setpoint flag when device disconnects
+            PID.target_angle = null;  // Reset target angle
             console.log(`Controller disconnected: ${clientAddress}`);
         } else {
             console.log(`Web client disconnected: ${clientAddress}`);
