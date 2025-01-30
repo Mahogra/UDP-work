@@ -20,13 +20,14 @@ const PID = {
     prev_error: 0,
     prev_time: Date.now(),
     target_angle: 0,
-    current_angle: 0
+    current_angle: 0,
+    initialized: false  // Flag to track if setpoint has been received
 };
 
 // Store device information
 const deviceState = {
-    port: 8766,              // Controller's UDP port
-    address: null,           // Will be set when controller connects
+    port: 8766,
+    address: null,
     authenticated: false
 };
 
@@ -49,6 +50,11 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server });
 
 function calculatePID(targetAngle, currentAngle) {
+    // Only calculate PID if we've received an initial setpoint
+    if (!PID.initialized) {
+        return { pwm: 0, error: 0 };
+    }
+
     const current_time = Date.now();
     const dt = (current_time - PID.prev_time) / 1000;
 
@@ -74,8 +80,8 @@ function calculatePID(targetAngle, currentAngle) {
 }
 
 function sendUDPCommand(command) {
-    if (!deviceState.address) {
-        console.log('No controller connected');
+    if (!deviceState.address || !PID.initialized) {
+        console.log('Cannot send command: No controller connected or no setpoint received');
         return;
     }
 
@@ -88,7 +94,7 @@ function sendUDPCommand(command) {
             if (err) {
                 console.error('UDP send error:', err);
             } else {
-                console.log(`UDP command sent to ${deviceState.address}:${deviceState.port}`);
+                console.log(`UDP command sent to ${deviceState.address}:${deviceState.port}: ${command}`);
             }
         }
     );
@@ -108,6 +114,12 @@ wss.on('connection', (ws, req) => {
                 if (!isNaN(setpoint)) {
                     console.log(`Received setpoint: ${setpoint}°`);
                     PID.target_angle = setpoint * Math.PI / 180;
+                    
+                    // Initialize PID controller with first setpoint
+                    if (!PID.initialized) {
+                        PID.initialized = true;
+                        console.log('PID controller initialized with first setpoint');
+                    }
                     
                     // Reset PID parameters for new setpoint
                     PID.integral = 0;
@@ -148,13 +160,14 @@ wss.on('connection', (ws, req) => {
                         PID.current_angle = currentAngle;
                         console.log(`Position feedback: ${currentAngle * 180 / Math.PI}°`);
                         
-                        // Calculate new PWM based on current position
-                        const pidOutput = calculatePID(PID.target_angle, PID.current_angle);
-                        
-                        if (Math.abs(pidOutput.error) > PID.stop_margin) {
-                            sendUDPCommand(pidOutput.pwm);
-                        } else {
-                            console.log('Target position reached');
+                        // Only send new commands if we've received a setpoint
+                        if (PID.initialized) {
+                            const pidOutput = calculatePID(PID.target_angle, PID.current_angle);
+                            if (Math.abs(pidOutput.error) > PID.stop_margin) {
+                                sendUDPCommand(pidOutput.pwm);
+                            } else {
+                                console.log('Target position reached');
+                            }
                         }
                     }
                 } catch (error) {
