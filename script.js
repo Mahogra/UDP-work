@@ -70,14 +70,6 @@ function calculatePID(targetAngle, currentAngle) {
     const derivative = dt > 0 ? (error - PID.prev_error) / dt : 0;
     let output = (PID.Kp * error) + (PID.Ki * PID.integral) + (PID.Kd * derivative);
     
-    // Jika error sangat kecil, langsung stop
-    if (Math.abs(error) < PID.stop_margin) {
-        output = 0;
-    } else {
-        // Pastikan output minimal tidak terlalu kecil
-        output = Math.sign(output) * Math.max(Math.abs(output), PID.min_pwm);
-    }
-
     // Dynamic PWM scaling
     const errorMagnitude = Math.abs(error);
     const dynamicMaxPwm = errorMagnitude > 0.5 ? PID.max_pwm : PID.max_pwm * 0.6;
@@ -148,16 +140,67 @@ wss.on('connection', (ws, req) => {
 
                     if (deviceState.authenticated) {
                         const pidOutput = calculatePID(PID.target_angle, PID.current_angle);
-                        if (pidOutput.pwm !== 0 || Math.abs(pidOutput.error) > PID.stop_margin) {
-                            sendUDPCommand(pidOutput.pwm);
-                        } else {
-                            console.log('Motor sudah berhenti, tidak mengirim perintah ulang.');
-                        }
+                        sendUDPCommand(pidOutput.pwm);
                     }
                 }
             } catch (error) {
                 console.error('Error processing setpoint:', error);
             }
+        } else {
+            if (!deviceState.authenticated) {
+                try {
+                    const authData = JSON.parse(message);
+                    if (authData.name === "Sean" && authData.password === "bayar10rb") {
+                        deviceState.authenticated = true;
+                        deviceState.address = clientAddress;
+                        ws.send("Authentication successful");
+                        console.log(`Controller authenticated: ${clientAddress}`);
+                    } else {
+                        ws.close();
+                    }
+                } catch (error) {
+                    console.error('Authentication error:', error);
+                    ws.close();
+                }
+            } else {
+                try {
+                    const currentAngle = parseFloat(message);
+                    if (!isNaN(currentAngle)) {
+                        PID.current_angle = currentAngle;
+                        console.log(`Position feedback: ${currentAngle * 180 / Math.PI}°`);
+                        
+                        if (deviceState.hasSetpoint) {
+                            const pidOutput = calculatePID(PID.target_angle, PID.current_angle);
+                            if (Math.abs(pidOutput.error) > PID.stop_margin) {
+                                sendUDPCommand(pidOutput.pwm);
+                            } else {
+                                console.log('Target position reached');
+                                sendUDPCommand(0); // Send stop command
+                            }
+                        }
+                    }
+                } catch (error) {
+                    console.error('Error processing feedback:', error);
+                }
+            }
         }
     });
+
+    ws.on('close', () => {
+        if (clientType === 'device') {
+            deviceState.authenticated = false;
+            deviceState.hasSetpoint = false;
+            PID.target_angle = null;
+            console.log(`Controller disconnected: ${clientAddress}`);
+        } else {
+            console.log(`Web client disconnected: ${clientAddress}`);
+        }
+    });
+});
+
+// Start servers
+const WS_PORT = 8765;
+server.listen(WS_PORT, () => {
+    console.log(`Server running on port ${WS_PORT}`);
+    console.log(`WebSocket server: ws://localhost:${WS_PORT}`);
 });
