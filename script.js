@@ -57,7 +57,9 @@ function calculatePID(targetAngle, currentAngle) {
     const current_time = Date.now();
     const dt = (current_time - PID.prev_time) / 1000;
     const error = targetAngle - currentAngle;
-    
+    if (currentAngle >= targetAngle){
+        return { pwm: 0, error: 0 };
+    } else {
     // Dynamic integral clamping
     const maxIntegral = 10;
     if (Math.abs(error) > PID.stop_margin * 2) {
@@ -79,9 +81,10 @@ function calculatePID(targetAngle, currentAngle) {
     PID.prev_time = current_time;
 
     return {
+
         pwm: Math.round(output),
         error: error
-    };
+    };}
 }
 
 function sendUDPCommand(command) {
