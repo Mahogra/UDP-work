@@ -179,6 +179,7 @@ wss.on('connection', (ws, req) => {
                             } else {
                                 console.log('Target position reached');
                                 sendUDPCommand(0); // Send stop command
+                                ws.close();
                             }
                         }
                     }
