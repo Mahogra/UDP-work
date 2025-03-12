@@ -4,29 +4,25 @@ import json
 import time
 import numpy as np
 from labjack_unified.devices import LabJackT7
-from encrypt import dekripsi
+from encrypt import enkripsi, dekripsi
 
 class MotorController:
     def __init__(self):
-        # Controller configuration
+        # Basic configuration
         self.anglecurr_total = 0
         self.ppr = 8 * 310  # Pulses per rotation
         self.lj = LabJackT7()
-        self.initial_encoder_count = 0  # Store initial encoder count
         
         # Network configuration
-        self.server_ip = "10.250.25.253"
+        self.server_ip = "10.96.1.51"
         self.udp_port = 8766
         self.ws_port = 8765
         
-        # Control and safety parameters
+        # Controller state
         self.running = True
-        self.last_command_time = time.time()
-        self.command_timeout = 1.0
         
         # Initialize hardware
         self.setup_labjack()
-        self.initial_encoder_count = self.lj.get_counter()  # Save initial position
 
     def setup_labjack(self):
         self.lj.set_pwm(dirport1='DAC')
@@ -34,50 +30,44 @@ class MotorController:
 
     def reset_position(self):
         self.anglecurr_total = 0
-        self.initial_encoder_count = self.lj.get_counter()
-        self.lj.reset_counter(self.initial_encoder_count)
+        initial_encoder_count = self.lj.get_counter()
+        self.lj.reset_counter(initial_encoder_count)
         return "Position Reset"
 
-    def get_current_angle(self):
-        # Calculate absolute angle based on initial position
-        current_count = self.lj.get_counter()
-        encoder_diff = current_count - self.initial_encoder_count
-        return (2 * np.pi / self.ppr) * encoder_diff
-
-    def update_position(self):
-        # Update the current absolute position
-        self.anglecurr_total = self.get_current_angle()
-        return self.anglecurr_total
-
     def run_motor(self, angle):
-        # Convert PWM command to duty cycle
-        pwm_value = np.clip(angle, -100, 100)
+        try:
+            # Clip PWM value to valid range
+            pwm_value = np.clip(angle, -100, 100)
+            initial_encoder_count = self.lj.get_counter()
 
-        if angle == 0:
-            self.lj.set_dutycycle(value1=0)  # Pastikan motor berhenti
-            print("Motor stopped, shutting down program...")
-
-            # Hentikan semua task asyncio
-            self.running = False
-            loop = asyncio.get_event_loop()
-            for task in asyncio.all_tasks(loop):
-                task.cancel()  # Hentikan semua task yang sedang berjalan
-
-            return "Motor Stopped"
-
-        else:
+            # Set motor PWM and wait
             self.lj.set_dutycycle(value1=pwm_value)
+            time.sleep(0.2)  # Longer duration for motor movement
+            
+            # Calculate angle change
+            encoder_count = self.lj.get_counter() - initial_encoder_count
+            current_angle = (2 * np.pi / self.ppr) * encoder_count
+            
+            # Update total angle
+            self.anglecurr_total += current_angle
 
-        time.sleep(0.1)
-        
-        return self.update_position()
+            return self.anglecurr_total
+            
+        except Exception as e:
+            print(f"Error in run_motor: {e}")
+            self.lj.set_dutycycle(value1=0)
+            return self.anglecurr_total
 
     async def setup_udp(self):
-        self.udp_transport, _ = await asyncio.get_event_loop().create_datagram_endpoint(
-            lambda: UDPClientProtocol(self),
-            local_addr=('0.0.0.0', self.udp_port)
-        )
-        print(f"UDP listener started on port {self.udp_port}")
+        try:
+            self.udp_transport, _ = await asyncio.get_event_loop().create_datagram_endpoint(
+                lambda: UDPClientProtocol(self),
+                local_addr=('0.0.0.0', self.udp_port)
+            )
+            print(f"UDP listener started on port {self.udp_port}")
+        except Exception as e:
+            print(f"Error setting up UDP: {e}")
+            self.running = False
 
     async def handle_websocket_feedback(self):
         while self.running:
@@ -90,43 +80,36 @@ class MotorController:
                     response = await websocket.recv()
                     print(f"WebSocket authentication: {response}")
 
-                    # Feedback loop with continuous position updates
                     while self.running:
-                        # Update position before sending feedback
-                        current_angle = self.update_position()
-                        await websocket.send(str(current_angle))
-                        print(f"Sent position feedback: {current_angle * 180 / np.pi}°")
-                        await asyncio.sleep(0.1)  # 10Hz feedback rate
+                        #await websocket.send(enkripsi(self.anglecurr_total))
+                        await websocket.send(str(self.anglecurr_total))
+                        print(f"Position: {self.anglecurr_total * 180 / np.pi:.2f}°")
+                        await asyncio.sleep(0.1)
 
             except websockets.exceptions.ConnectionClosed:
-                print("WebSocket connection closed, stopping motor...")
-                self.lj.set_dutycycle(value1=0)  # Hentikan motor jika koneksi putus
+                print("WebSocket connection closed, reconnecting...")
                 await asyncio.sleep(1)
             except Exception as e:
                 print(f"WebSocket Error: {e}")
-                self.lj.set_dutycycle(value1=0)  # Hentikan motor jika terjadi error
                 await asyncio.sleep(1)
 
-    def safety_check(self):
-        if time.time() - self.last_command_time > self.command_timeout:
-            self.lj.set_dutycycle(value1=0)
-            print("Safety timeout: Motor stopped")
-
     async def run(self):
-        await self.setup_udp()
-        await self.handle_websocket_feedback()
+        try:
+            await asyncio.gather(
+                self.setup_udp(),
+                self.handle_websocket_feedback()
+            )
+        except Exception as e:
+            print(f"Error in main loop: {e}")
+        finally:
+            self.running = False
+            self.lj.set_dutycycle(value1=0)
 
     def __del__(self):
         self.running = False
-        print("Shutting down controller, stopping motor...")
-
-        # Pastikan motor berhenti sebelum keluar
         self.lj.set_dutycycle(value1=0)
-
-        # Tutup koneksi UDP jika ada
         if hasattr(self, 'udp_transport'):
             self.udp_transport.close()
-
         self.lj.close()
 
 class UDPClientProtocol:
@@ -140,9 +123,7 @@ class UDPClientProtocol:
         try:
             message = data.decode()
             decrypted_message = dekripsi(eval(message))
-            print(f"Received UDP command: {decrypted_message}")
-
-            self.controller.last_command_time = time.time()
+            print(f"Received command: {decrypted_message}")
 
             if decrypted_message == "RESET":
                 response = self.controller.reset_position()
@@ -153,18 +134,16 @@ class UDPClientProtocol:
             print(f"Command executed: {response}")
             
         except Exception as e:
-            print(f"Error processing UDP command: {e}")
-        finally:
-            self.controller.safety_check()
+            print(f"Error processing command: {e}")
 
 async def main():
     controller = MotorController()
     try:
         await controller.run()
     except KeyboardInterrupt:
-        print("Shutting down controller...")
+        print("Shutting down...")
     finally:
-        controller.__del__()  # Panggil destructor untuk menghentikan motor dengan aman
+        controller.__del__()
 
 if __name__ == "__main__":
     asyncio.run(main())
